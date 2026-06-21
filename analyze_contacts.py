@@ -498,6 +498,36 @@ _TYPE_ORDER = [
 ]
 
 
+def build_chain_display_names(chain_roles, dna_chains, attP_top_chain):
+    """
+    Return dict: internal chain ID -> short display string, e.g.
+      E -> 'attP top'   F -> 'attP bot'
+      G -> 'attB top'   H -> 'attB top'   I -> 'attB bot'   J -> 'attB bot'
+
+    For attP: top/bot is determined by attP_top_chain.
+    For attB: among the attB-L chains, the first alphabetically is called 'top';
+              among attB-R chains, the first alphabetically is also 'top'.
+              (For this structure this matches the GT/TT strand assignment.)
+    """
+    names = {}
+    attB_L_chains = sorted(c for c in dna_chains if "attB-L" in chain_roles.get(c, ""))
+    attB_R_chains = sorted(c for c in dna_chains if "attB-R" in chain_roles.get(c, ""))
+
+    for chain in dna_chains:
+        role = chain_roles.get(chain, "")
+        if "attP" in role:
+            names[chain] = "attP top" if chain == attP_top_chain else "attP bot"
+        elif "attB-L" in role:
+            strand = "top" if chain == attB_L_chains[0] else "bot"
+            names[chain] = f"attB {strand}"
+        elif "attB-R" in role:
+            strand = "top" if chain == attB_R_chains[0] else "bot"
+            names[chain] = f"attB {strand}"
+        else:
+            names[chain] = role or chain
+    return names
+
+
 def _sort_key(k):
     # k = (prot_chain, prot_seq, prot_comp, dna_chain, dna_seq, dna_comp, dna_label)
     # Sort protein by chain then seq_id; DNA by chain then by L/R label numerically.
@@ -523,7 +553,7 @@ def _sort_key(k):
         return (k[0], 0, k[2]) + dna_sort
 
 
-def report_summary(contacts, cutoff, hb_cutoff, output=None):
+def report_summary(contacts, cutoff, hb_cutoff, chain_display, output=None):
     fh = open(output, "w", encoding="utf-8") if output else sys.stdout
 
     # Pre-compute per-pair metadata
@@ -536,7 +566,8 @@ def report_summary(contacts, cutoff, hb_cutoff, output=None):
         n_hb   = sum(1 for t in pair_types if t == "hbond")
         n_hp   = sum(1 for t in pair_types if t == "hydrophobic")
         rtype  = residue_contact_type(pair_types)
-        rows.append((pc, ps, aa1(pcomp), dc, dlabel, base1(dcomp), len(pairs), min_dist,
+        rows.append((pc, ps, aa1(pcomp), chain_display.get(dc, dc),
+                     dlabel, base1(dcomp), len(pairs), min_dist,
                      n_hb, n_hp, rtype))
 
     # Counts by type
@@ -546,16 +577,16 @@ def report_summary(contacts, cutoff, hb_cutoff, output=None):
 
     print(f"Protein-DNA contacts within {cutoff:.1f} A  "
           f"(H-bond cutoff: {hb_cutoff:.1f} A)", file=fh)
-    print("=" * 96, file=fh)
-    print(f"{'Prot':<6}{'Res#':<7}{'AA':<6}"
-          f"{'DNA':<6}{'Pos':<7}{'Base':<5}"
+    print("=" * 104, file=fh)
+    print(f"{'Prot':<6}{'Res#':<7}{'AA':<5}"
+          f"{'DNA':<11}{'Pos':<7}{'Base':<6}"
           f"{'Pairs':<7}{'HB':<5}{'HP':<5}{'MinDist(A)':<12}{'Contact type'}",
           file=fh)
-    print("-" * 96, file=fh)
+    print("-" * 104, file=fh)
 
-    for (pc, ps, pcomp, dc, dlabel, dcomp,
+    for (pc, ps, pcomp, dname, dlabel, dcomp,
          npairs, min_dist, n_hb, n_hp, rtype) in rows:
-        print(f"{pc:<6}{ps:<7}{pcomp:<6}{dc:<6}{dlabel:<7}{dcomp:<5}"
+        print(f"{pc:<6}{ps:<7}{pcomp:<5}{dname:<11}{dlabel:<7}{dcomp:<6}"
               f"{npairs:<7}{n_hb:<5}{n_hp:<5}{min_dist:<12.2f}{rtype}",
               file=fh)
 
@@ -571,7 +602,7 @@ def report_summary(contacts, cutoff, hb_cutoff, output=None):
         print(f"Summary written to {output}")
 
 
-def report_detailed(contacts, cutoff, hb_cutoff, output=None):
+def report_detailed(contacts, cutoff, hb_cutoff, chain_display, output=None):
     fh = open(output, "w", encoding="utf-8") if output else sys.stdout
 
     print(f"Detailed protein-DNA contacts within {cutoff:.1f} A  "
@@ -585,12 +616,12 @@ def report_detailed(contacts, cutoff, hb_cutoff, output=None):
         pairs = sorted(contacts[key], key=lambda t: t[2])
         pair_types = [pt for _, _, _, pt in pairs]
         rtype = residue_contact_type(pair_types)
+        dname = chain_display.get(dc, dc)
 
-        print(f"\n{aa1(pcomp)}{ps} (chain {pc})  <-->  {base1(dcomp)} {dlabel} (chain {dc})"
+        print(f"\n{aa1(pcomp)}{ps} (chain {pc})  <-->  {base1(dcomp)} {dlabel} ({dname})"
               f"  [{rtype}]", file=fh)
         for pa, da, dist, pt in pairs:
-            label = type_label[pt]
-            print(f"    {pa:<6} -- {da:<6}  {dist:.2f} A   {label}", file=fh)
+            print(f"    {pa:<6} -- {da:<6}  {dist:.2f} A   {type_label[pt]}", file=fh)
 
     if output:
         fh.close()
@@ -692,15 +723,18 @@ def main():
             role += " [bottom strand]"
         print(f"  chain {chain}/{auth} ({role}): seq {lo}={first} .. seq {hi}={last}")
 
+    chain_display = build_chain_display_names(chain_roles, dna_chains, attP_top)
+
     print(f"\nSearching for contacts within {args.cutoff} A "
           f"(H-bond cutoff: {args.hb_cutoff} A) ...", flush=True)
     contacts = find_contacts(protein_atoms, dna_atoms,
                              args.cutoff, args.hb_cutoff, pos_labels)
 
-    report_summary(contacts, args.cutoff, args.hb_cutoff, args.output)
+    report_summary(contacts, args.cutoff, args.hb_cutoff, chain_display, args.output)
 
     if args.detailed or args.detailed_output:
-        report_detailed(contacts, args.cutoff, args.hb_cutoff, args.detailed_output)
+        report_detailed(contacts, args.cutoff, args.hb_cutoff, chain_display,
+                        args.detailed_output)
 
 
 if __name__ == "__main__":
