@@ -369,6 +369,29 @@ def load_atoms(data, protein_chains, dna_chains):
 # Contact classification
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+_AA1 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "MSE": "M",  # selenomethionine
+}
+
+
+def aa1(three_letter):
+    return _AA1.get(three_letter.upper(), three_letter)
+
+
+def base1(comp_id):
+    """DA -> A, DT -> T, DG -> G, DC -> C, A -> A, etc."""
+    name = comp_id.upper().lstrip("D")
+    return name if name in ("A", "C", "G", "T", "U") else comp_id
+
+
 # Elements that can participate in H-bonds as donor or acceptor
 _HBOND_ELEMENTS = {"N", "O", "S"}
 
@@ -513,7 +536,7 @@ def report_summary(contacts, cutoff, hb_cutoff, output=None):
         n_hb   = sum(1 for t in pair_types if t == "hbond")
         n_hp   = sum(1 for t in pair_types if t == "hydrophobic")
         rtype  = residue_contact_type(pair_types)
-        rows.append((pc, ps, pcomp, dc, dlabel, dcomp, len(pairs), min_dist,
+        rows.append((pc, ps, aa1(pcomp), dc, dlabel, base1(dcomp), len(pairs), min_dist,
                      n_hb, n_hp, rtype))
 
     # Counts by type
@@ -563,7 +586,7 @@ def report_detailed(contacts, cutoff, hb_cutoff, output=None):
         pair_types = [pt for _, _, _, pt in pairs]
         rtype = residue_contact_type(pair_types)
 
-        print(f"\n{pcomp}{ps} (chain {pc})  <-->  {dcomp} {dlabel} (chain {dc})"
+        print(f"\n{aa1(pcomp)}{ps} (chain {pc})  <-->  {base1(dcomp)} {dlabel} (chain {dc})"
               f"  [{rtype}]", file=fh)
         for pa, da, dist, pt in pairs:
             label = type_label[pt]
