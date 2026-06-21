@@ -18,9 +18,19 @@ Classification is heuristic — no hydrogen positions are required — and is
 based solely on heavy-atom element identity and distance, which is appropriate
 for cryo-EM structures where H-atoms are not modelled.
 
+DNA positions are reported in center-out notation relative to the recombination
+site center:
+  L1, L2, L3 ... = bases going 5' from the crossover point
+  R1, R2, R3 ... = bases going 3' from the crossover point
+
+For attB, the crossover is the junction between the attB-L and attB-R chains.
+For attP (continuous duplex), the center defaults to the midpoint of the top
+strand and can be overridden with --attP-center.
+
 Usage:
     python analyze_contacts.py 9iu2.cif
     python analyze_contacts.py 9iu2.cif -c 4.0 --hb-cutoff 3.5 -o contacts.txt
+    python analyze_contacts.py 9iu2.cif --attP-center 26 --attP-top-chain E
     python analyze_contacts.py 9iu2.cif --detailed --detailed-output atom_pairs.txt
 """
 
@@ -147,10 +157,39 @@ def parse_cif(path):
 
 
 # ---------------------------------------------------------------------------
+# Chain ID mapping (label_asym_id <-> auth_asym_id)
+# ---------------------------------------------------------------------------
+
+def build_chain_id_maps(data):
+    """
+    Return (label_to_auth, auth_to_label) dicts built from _atom_site columns.
+
+    mmCIF uses two parallel chain-ID systems:
+      label_asym_id -- internal sequential IDs used in atom coordinates (A, B, ... G, H, ...)
+      auth_asym_id  -- author-assigned IDs used in _entity_poly.pdbx_strand_id (A, G1, H2, ...)
+
+    pdbx_strand_id contains author IDs, so we need this map to find the right
+    atoms for each entity.
+    """
+    label_col = data.get("_atom_site.label_asym_id", [])
+    auth_col  = data.get("_atom_site.auth_asym_id",  [])
+    label_to_auth = {}
+    auth_to_label = {}
+    for lbl, auth in zip(label_col, auth_col):
+        label_to_auth.setdefault(lbl, auth)
+        auth_to_label.setdefault(auth, lbl)
+    return label_to_auth, auth_to_label
+
+
+# ---------------------------------------------------------------------------
 # Chain classification
 # ---------------------------------------------------------------------------
 
-def classify_chains(data):
+def classify_chains(data, auth_to_label):
+    """
+    Return (protein_chains, dna_chains) as sets of *label_asym_id* strings.
+    pdbx_strand_id contains author chain IDs, which are translated via auth_to_label.
+    """
     protein_chains = set()
     dna_chains = set()
 
@@ -158,14 +197,113 @@ def classify_chains(data):
     strands = data.get("_entity_poly.pdbx_strand_id", [])
 
     for etype, strand_field in zip(types, strands):
-        chain_ids = [c.strip() for c in strand_field.split(",") if c.strip()]
-        etype_lc = etype.lower()
+        auth_ids  = [c.strip() for c in strand_field.split(",") if c.strip()]
+        label_ids = [auth_to_label.get(a, a) for a in auth_ids]
+        etype_lc  = etype.lower()
         if "polypeptide" in etype_lc:
-            protein_chains.update(chain_ids)
+            protein_chains.update(label_ids)
         elif "deoxyribonucleotide" in etype_lc or "ribonucleotide" in etype_lc:
-            dna_chains.update(chain_ids)
+            dna_chains.update(label_ids)
 
     return protein_chains, dna_chains
+
+
+def get_chain_roles(data, auth_to_label):
+    """
+    Return dict: chain_id -> entity description string
+    e.g. {'E': 'attP', 'F': 'attP', 'G1': 'attB-L', 'G2': 'attB-R', ...}
+    """
+    entity_desc_map = {}
+    for eid, desc in zip(data.get("_entity.id", []),
+                         data.get("_entity.pdbx_description", [])):
+        entity_desc_map[eid] = desc.strip("'\"")
+
+    roles = {}
+    for eid, strand_field in zip(data.get("_entity_poly.entity_id", []),
+                                  data.get("_entity_poly.pdbx_strand_id", [])):
+        desc = entity_desc_map.get(eid, "unknown")
+        for auth_chain in [c.strip() for c in strand_field.split(",") if c.strip()]:
+            label_chain = auth_to_label.get(auth_chain, auth_chain)
+            roles[label_chain] = desc
+    return roles
+
+
+def compute_seq_ranges(dna_atoms):
+    """Return dict: chain -> (min_seq_id_int, max_seq_id_int)."""
+    ranges = {}
+    for atom in dna_atoms:
+        chain = atom["chain"]
+        try:
+            sid = int(atom["seq_id"])
+        except ValueError:
+            continue
+        lo, hi = ranges.get(chain, (sid, sid))
+        ranges[chain] = (min(lo, sid), max(hi, sid))
+    return ranges
+
+
+def build_position_labels(chain_roles, dna_chains, ranges,
+                          attP_center=None, attP_top_chain=None):
+    """
+    Return dict: (chain, seq_id_str) -> center-out label  e.g. 'L3', 'R12'
+
+    attB-L chains: the 3' end (highest seq_id) is L1; count outward 5'.
+    attB-R chains: the 5' end (lowest seq_id)  is R1; count outward 3'.
+
+    attP top strand:  positions 1..center -> L{center}..L1,
+                      positions center+1..end -> R1..R{end-center}
+    attP bottom strand (antiparallel complement of top):
+                      seq_id 1 of bottom pairs with the 3' end of top (R side),
+                      so labels mirror the top strand in reverse.
+    """
+    labels = {}
+
+    attP_chains = sorted(c for c in dna_chains if "attP" in chain_roles.get(c, ""))
+    top_chain = (attP_top_chain if attP_top_chain in attP_chains
+                 else (attP_chains[0] if attP_chains else None))
+
+    for chain in dna_chains:
+        role = chain_roles.get(chain, "")
+        if chain not in ranges:
+            continue
+        lo, hi = ranges[chain]
+
+        if "attB-L" in role:
+            # 3' end (hi) = L1, counting outward toward 5'
+            for s in range(lo, hi + 1):
+                labels[(chain, str(s))] = f"L{hi - s + 1}"
+
+        elif "attB-R" in role:
+            # 5' end (lo) = R1, counting outward toward 3'
+            for s in range(lo, hi + 1):
+                labels[(chain, str(s))] = f"R{s - lo + 1}"
+
+        elif "attP" in role:
+            top_lo, top_hi = ranges.get(top_chain, (lo, hi))
+            top_len = top_hi - top_lo + 1
+            center = attP_center if attP_center is not None else top_len // 2
+
+            if chain == top_chain:
+                # 5' side (pos 1..center): L{center}..L1
+                # 3' side (pos center+1..end): R1..R{end-center}
+                for s in range(lo, hi + 1):
+                    pos = s - lo + 1  # 1-based position along chain
+                    if pos <= center:
+                        labels[(chain, str(s))] = f"L{center - pos + 1}"
+                    else:
+                        labels[(chain, str(s))] = f"R{pos - center}"
+            else:
+                # Bottom strand — antiparallel. seq_id lo pairs with top_hi
+                # (the 3'/R side), so the first residue of the bottom strand
+                # gets the same label as the last residue of the top strand.
+                for s in range(lo, hi + 1):
+                    paired = top_len - (s - lo)  # paired position on top (1-based)
+                    if paired <= center:
+                        labels[(chain, str(s))] = f"L{center - paired + 1}"
+                    else:
+                        labels[(chain, str(s))] = f"R{paired - center}"
+
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +428,10 @@ def residue_contact_type(pair_types):
 # Contact search
 # ---------------------------------------------------------------------------
 
-def find_contacts(protein_atoms, dna_atoms, cutoff, hb_cutoff):
+def find_contacts(protein_atoms, dna_atoms, cutoff, hb_cutoff, pos_labels):
     """
     Return dict:
-        (prot_chain, prot_seq, prot_comp, dna_chain, dna_seq, dna_comp)
+        (prot_chain, prot_seq, prot_comp, dna_chain, dna_seq, dna_comp, dna_pos_label)
         -> [(prot_atom_id, dna_atom_id, distance, pair_type), ...]
     """
     cutoff2 = cutoff * cutoff
@@ -308,8 +446,9 @@ def find_contacts(protein_atoms, dna_atoms, cutoff, hb_cutoff):
             if d2 <= cutoff2:
                 dist = math.sqrt(d2)
                 ptype = classify_pair(pa["element"], da["element"], dist, hb_cutoff)
+                dna_label = pos_labels.get((da["chain"], da["seq_id"]), da["seq_id"])
                 key = (pa["chain"], pa["seq_id"], pa["comp_id"],
-                       da["chain"], da["seq_id"], da["comp_id"])
+                       da["chain"], da["seq_id"], da["comp_id"], dna_label)
                 contacts[key].append((pa["atom_id"], da["atom_id"], dist, ptype))
 
     return contacts
@@ -337,10 +476,28 @@ _TYPE_ORDER = [
 
 
 def _sort_key(k):
+    # k = (prot_chain, prot_seq, prot_comp, dna_chain, dna_seq, dna_comp, dna_label)
+    # Sort protein by chain then seq_id; DNA by chain then by L/R label numerically.
+    dna_label = k[6]  # e.g. 'L3', 'R12', or raw seq_id if no label
+    if dna_label and dna_label[0] in ("L", "R"):
+        # L labels sort before R labels; within each, sort numerically
+        label_order = 0 if dna_label[0] == "L" else 1
+        try:
+            label_num = int(dna_label[1:])
+            # For L labels, higher number = farther from center; sort ascending so L1 comes last
+            # Convention: display in order from center outward (L1, L2 ... then R1, R2 ...)
+            dna_sort = (k[3], label_order, label_num)
+        except ValueError:
+            dna_sort = (k[3], 2, 0)
+    else:
+        try:
+            dna_sort = (k[3], 2, int(dna_label))
+        except (ValueError, TypeError):
+            dna_sort = (k[3], 2, 0)
     try:
-        return (k[0], int(k[1]), k[2], k[3], int(k[4]))
+        return (k[0], int(k[1]), k[2]) + dna_sort
     except ValueError:
-        return (k[0], 0, k[2], k[3], 0)
+        return (k[0], 0, k[2]) + dna_sort
 
 
 def report_summary(contacts, cutoff, hb_cutoff, output=None):
@@ -349,14 +506,14 @@ def report_summary(contacts, cutoff, hb_cutoff, output=None):
     # Pre-compute per-pair metadata
     rows = []
     for key in sorted(contacts, key=_sort_key):
-        pc, ps, pcomp, dc, ds, dcomp = key
+        pc, ps, pcomp, dc, ds, dcomp, dlabel = key
         pairs = contacts[key]
         min_dist = min(d for _, _, d, _ in pairs)
         pair_types = [pt for _, _, _, pt in pairs]
         n_hb   = sum(1 for t in pair_types if t == "hbond")
         n_hp   = sum(1 for t in pair_types if t == "hydrophobic")
         rtype  = residue_contact_type(pair_types)
-        rows.append((pc, ps, pcomp, dc, ds, dcomp, len(pairs), min_dist,
+        rows.append((pc, ps, pcomp, dc, dlabel, dcomp, len(pairs), min_dist,
                      n_hb, n_hp, rtype))
 
     # Counts by type
@@ -368,14 +525,14 @@ def report_summary(contacts, cutoff, hb_cutoff, output=None):
           f"(H-bond cutoff: {hb_cutoff:.1f} A)", file=fh)
     print("=" * 96, file=fh)
     print(f"{'Prot':<6}{'Res#':<7}{'AA':<6}"
-          f"{'DNA':<6}{'Base#':<7}{'Base':<5}"
+          f"{'DNA':<6}{'Pos':<7}{'Base':<5}"
           f"{'Pairs':<7}{'HB':<5}{'HP':<5}{'MinDist(A)':<12}{'Contact type'}",
           file=fh)
     print("-" * 96, file=fh)
 
-    for (pc, ps, pcomp, dc, ds, dcomp,
+    for (pc, ps, pcomp, dc, dlabel, dcomp,
          npairs, min_dist, n_hb, n_hp, rtype) in rows:
-        print(f"{pc:<6}{ps:<7}{pcomp:<6}{dc:<6}{ds:<7}{dcomp:<5}"
+        print(f"{pc:<6}{ps:<7}{pcomp:<6}{dc:<6}{dlabel:<7}{dcomp:<5}"
               f"{npairs:<7}{n_hb:<5}{n_hp:<5}{min_dist:<12.2f}{rtype}",
               file=fh)
 
@@ -401,12 +558,12 @@ def report_detailed(contacts, cutoff, hb_cutoff, output=None):
     type_label = {"hbond": "H-bond", "hydrophobic": "Hydrophobic", "polar-vdw": "polar-vdW"}
 
     for key in sorted(contacts, key=_sort_key):
-        pc, ps, pcomp, dc, ds, dcomp = key
+        pc, ps, pcomp, dc, ds, dcomp, dlabel = key
         pairs = sorted(contacts[key], key=lambda t: t[2])
         pair_types = [pt for _, _, _, pt in pairs]
         rtype = residue_contact_type(pair_types)
 
-        print(f"\n{pcomp}{ps} (chain {pc})  <-->  {dcomp}{ds} (chain {dc})"
+        print(f"\n{pcomp}{ps} (chain {pc})  <-->  {dcomp} {dlabel} (chain {dc})"
               f"  [{rtype}]", file=fh)
         for pa, da, dist, pt in pairs:
             label = type_label[pt]
@@ -435,6 +592,14 @@ def main():
                         help="Print every atom pair with its type (to stdout)")
     parser.add_argument("--detailed-output", default=None,
                         help="Write atom-level detail to this file")
+    parser.add_argument("--attP-center", type=int, default=None,
+                        help="Last L-arm position (1-based) on the attP top strand. "
+                             "Defaults to half the top-strand length. "
+                             "For a 52 nt top strand this defaults to 26, placing L1 "
+                             "at position 26 and R1 at position 27.")
+    parser.add_argument("--attP-top-chain", default=None,
+                        help="Chain ID of the attP top strand (default: first "
+                             "alphabetically among attP chains, e.g. 'E').")
     args = parser.parse_args()
 
     if args.hb_cutoff > args.cutoff:
@@ -444,13 +609,22 @@ def main():
     print(f"Parsing {args.cif} ...", flush=True)
     data = parse_cif(args.cif)
 
-    protein_chains, dna_chains = classify_chains(data)
+    label_to_auth, auth_to_label = build_chain_id_maps(data)
+    protein_chains, dna_chains = classify_chains(data, auth_to_label)
     if not protein_chains and not dna_chains:
         print("WARNING: No protein or DNA chains found.")
         sys.exit(1)
 
-    print(f"Protein chains : {sorted(protein_chains)}")
-    print(f"DNA chains     : {sorted(dna_chains)}")
+    chain_roles = get_chain_roles(data, auth_to_label)
+
+    def display(chains):
+        return [f"{c}({label_to_auth.get(c,c)})" for c in sorted(chains)]
+
+    print(f"Protein chains : {display(protein_chains)}")
+    print(f"DNA chains     : {display(dna_chains)}")
+    for chain in sorted(dna_chains):
+        auth = label_to_auth.get(chain, chain)
+        print(f"  {chain} ({auth}): {chain_roles.get(chain, '?')}")
 
     protein_atoms, dna_atoms = load_atoms(data, protein_chains, dna_chains)
     print(f"Protein atoms  : {len(protein_atoms):,}")
@@ -460,9 +634,45 @@ def main():
         print("ERROR: No atoms loaded for one or both molecule types.")
         sys.exit(1)
 
-    print(f"Searching for contacts within {args.cutoff} A "
+    ranges = compute_seq_ranges(dna_atoms)
+
+    # Allow user to specify attP top chain by either author or label ID
+    attP_top_arg = args.attP_top_chain
+    if attP_top_arg:
+        attP_top_arg = auth_to_label.get(attP_top_arg, attP_top_arg)
+
+    pos_labels = build_position_labels(
+        chain_roles, dna_chains, ranges,
+        attP_center=args.attP_center,
+        attP_top_chain=attP_top_arg,
+    )
+
+    # Determine which chain was chosen as attP top for display
+    attP_top = (attP_top_arg
+                or next((c for c in sorted(dna_chains)
+                         if "attP" in chain_roles.get(c, "")), None))
+    attP_ctr = args.attP_center
+    if attP_ctr is None and attP_top and attP_top in ranges:
+        lo, hi = ranges[attP_top]
+        attP_ctr = (hi - lo + 1) // 2
+
+    print(f"\nDNA position labelling (center-out notation):")
+    for chain in sorted(dna_chains):
+        auth = label_to_auth.get(chain, chain)
+        lo, hi = ranges.get(chain, (1, 1))
+        first = pos_labels.get((chain, str(lo)), "?")
+        last  = pos_labels.get((chain, str(hi)), "?")
+        role  = chain_roles.get(chain, "?")
+        if "attP" in role and chain == attP_top:
+            role += f" [top strand, center after position {attP_ctr}]"
+        elif "attP" in role:
+            role += " [bottom strand]"
+        print(f"  chain {chain}/{auth} ({role}): seq {lo}={first} .. seq {hi}={last}")
+
+    print(f"\nSearching for contacts within {args.cutoff} A "
           f"(H-bond cutoff: {args.hb_cutoff} A) ...", flush=True)
-    contacts = find_contacts(protein_atoms, dna_atoms, args.cutoff, args.hb_cutoff)
+    contacts = find_contacts(protein_atoms, dna_atoms,
+                             args.cutoff, args.hb_cutoff, pos_labels)
 
     report_summary(contacts, args.cutoff, args.hb_cutoff, args.output)
 
