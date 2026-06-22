@@ -268,17 +268,7 @@ def build_position_labels(chain_roles, dna_chains, ranges,
             continue
         lo, hi = ranges[chain]
 
-        if "attB-L" in role:
-            # 3' end (hi) = L1, counting outward toward 5'
-            for s in range(lo, hi + 1):
-                labels[(chain, str(s))] = f"L{hi - s + 1}"
-
-        elif "attB-R" in role:
-            # 5' end (lo) = R1, counting outward toward 3'
-            for s in range(lo, hi + 1):
-                labels[(chain, str(s))] = f"R{s - lo + 1}"
-
-        elif "attP" in role:
+        if "attP" in role:
             top_lo, top_hi = ranges.get(top_chain, (lo, hi))
             top_len = top_hi - top_lo + 1
             center = attP_center if attP_center is not None else top_len // 2
@@ -302,6 +292,49 @@ def build_position_labels(chain_roles, dna_chains, ranges,
                         labels[(chain, str(s))] = f"L{center - paired + 1}"
                     else:
                         labels[(chain, str(s))] = f"R{paired - center}"
+
+    # ---- attB chains -------------------------------------------------------
+    # Each attB strand is covered by two chains:
+    #   "crossing" chain (longer): runs from L{N-1} through L1 to R1
+    #   "continuation" chain (shorter): runs from R2 onward
+    # The longer attB-L chain is the crossing chain for the top strand;
+    # the longer attB-R chain is the crossing chain for the bottom strand.
+    all_attB = [c for c in dna_chains
+                if "attB-L" in chain_roles.get(c, "") or
+                   "attB-R" in chain_roles.get(c, "")]
+
+    if all_attB:
+        def _len(c):
+            lo2, hi2 = ranges.get(c, (1, 1))
+            return hi2 - lo2 + 1
+
+        attB_L = sorted((c for c in all_attB if "attB-L" in chain_roles.get(c, "")),
+                        key=_len, reverse=True)
+        attB_R = sorted((c for c in all_attB if "attB-R" in chain_roles.get(c, "")),
+                        key=_len, reverse=True)
+
+        # crossing chains: longer attB-L (top) and longer attB-R (bottom)
+        crossing = set()
+        if attB_L:
+            crossing.add(attB_L[0])
+        if attB_R:
+            crossing.add(attB_R[0])
+        continuation = set(all_attB) - crossing
+
+        for chain in all_attB:
+            lo, hi = ranges.get(chain, (1, 1))
+            N = hi - lo + 1
+            if chain in crossing:
+                # seq 1..N-1  -> L{N-1}..L1
+                # seq N       -> R1
+                for s in range(lo, hi + 1):
+                    k = s - lo + 1  # 1-based position
+                    labels[(chain, str(s))] = f"L{N - k}" if k < N else "R1"
+            else:
+                # seq 1..M -> R2..R{M+1}
+                for s in range(lo, hi + 1):
+                    k = s - lo + 1
+                    labels[(chain, str(s))] = f"R{k + 1}"
 
     return labels
 
